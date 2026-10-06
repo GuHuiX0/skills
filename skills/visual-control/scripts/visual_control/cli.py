@@ -282,6 +282,83 @@ _GLYPHS = {
 }
 
 
+def _sample_frame(bgra: bytes, width: int, height: int, step: int = 37):
+    """Cheap pixel statistics used to sanity-check a capture."""
+    total = 0
+    dark = 0
+    darkest = 255
+    brightest = 0
+    stride = width * 4
+    for y in range(0, height, step):
+        row = y * stride
+        for x in range(0, width, step):
+            offset = row + x * 4
+            b, g, r = bgra[offset], bgra[offset + 1], bgra[offset + 2]
+            luma = (r * 299 + g * 587 + b * 114) // 1000
+            darkest = min(darkest, luma)
+            brightest = max(brightest, luma)
+            total += 1
+            if luma < 16:
+                dark += 1
+    return {
+        "samples": total,
+        "dark_ratio": round(dark / total, 3) if total else 0.0,
+        "darkest_luma": darkest,
+        "brightest_luma": brightest,
+    }
+
+
+def _blank_check(frame, args):
+    """Decide whether a window capture should be treated as an empty surface.
+
+    ``--blank-threshold`` is the luma at or above which the capture counts as
+    blank (default 250).  ``--assume-blank`` forces the verdict and exists to
+    exercise the escalation ladder on demand, since a genuinely blank DWM surface
+    cannot be produced from a normal test application.
+    """
+    stats = _sample_frame(frame.bgra, frame.width, frame.height)
+    if stats["samples"] < 20:
+        return None
+    if getattr(args, "assume_blank", False):
+        return stats
+    threshold = int(getattr(args, "blank_threshold", 250) or 250)
+    return stats if stats["darkest_luma"] >= threshold else None
+
+def _crop_frame(frame, offset_x: int, offset_y: int, width: int, height: int):
+    """Sub-rectangle of a window buffer; origin follows the crop."""
+    from .driver import Frame as _Frame
+
+    offset_x = max(0, min(offset_x, frame.width - 1))
+    offset_y = max(0, min(offset_y, frame.height - 1))
+    width = max(1, min(width, frame.width - offset_x))
+    height = max(1, min(height, frame.height - offset_y))
+    stride = frame.width * 4
+    rows = []
+    for y in range(offset_y, offset_y + height):
+        start = y * stride + offset_x * 4
+        rows.append(frame.bgra[start : start + width * 4])
+    return _Frame(
+        width=width,
+        height=height,
+        bgra=b"".join(rows),
+        origin_x=frame.origin_x + offset_x,
+        origin_y=frame.origin_y + offset_y,
+    )
+
+
+def _parse_region(value: str) -> Tuple[int, int, int, int]:
+    parts = [p for p in str(value).split(",") if p.strip() != ""]
+    if len(parts) != 4:
+        raise CliError("--region expects 'X,Y,W,H'")
+    try:
+        x, y, w, h = (int(round(float(p))) for p in parts)
+    except ValueError as exc:
+        raise CliError("--region expects integers 'X,Y,W,H'") from exc
+    if w <= 0 or h <= 0:
+        raise CliError("--region width/height must be positive")
+    return x, y, w, h
+
+
 def _observe(args) -> Dict[str, Any]:
     driver = driver_mod.load((CAP_CAPTURE,), args.backend)
     screens = driver.screens()
@@ -297,31 +374,129 @@ def _observe(args) -> Dict[str, Any]:
 
     region = (chosen.x, chosen.y, chosen.width, chosen.height)
     region_source = f"screen-{chosen.index}"
-
-    if args.region:
-        parts = [p for p in str(args.region).split(",") if p.strip() != ""]
-        if len(parts) != 4:
-            raise CliError("--region expects 'X,Y,W,H'")
-        try:
-            region = tuple(int(round(float(p))) for p in parts)  # type: ignore[assignment]
-        except ValueError as exc:
-            raise CliError("--region expects integers 'X,Y,W,H'") from exc
+    sub_region = _parse_region(args.region) if args.region else None
+    if sub_region and not args.window:
+        region = sub_region
         region_source = "explicit"
-
+    window_meta = None
+    capture_notes: List[str] = []
+    capture_mode = args.capture
+    window_info = None
     if args.window:
         info, focus_state = _target_window(driver, args)
-        x, y, width, height = info.x, info.y, info.width, info.height
-        if args.region:
-            rx, ry, rw, rh = region
-            region = (x + rx, y + ry, min(rw, width), min(rh, height))
-        else:
-            region = (x, y, width, height)
-        region_source = f"window:{info.title}"
+        window_info = info
         window_meta = _window_ref(info, focus_state)
-    else:
-        window_meta = None
+        region = (info.x, info.y, info.width, info.height)
+        region_source = f"window:{info.title}"
+        if sub_region:
+            # with --window, --region is relative to the window in BOTH capture
+            # modes; only the coordinate of the resulting frame differs
+            rx, ry, rw, rh = sub_region
+            region = (
+                info.x + rx,
+                info.y + ry,
+                min(rw, info.width),
+                min(rh, info.height),
+            )
+            region_source = f"window-region:{info.title}"
 
-    frame = driver.grab(region)
+    # --- window-own-pixels capture (occlusion independent) -----------------
+    frame = None
+    focus_fallback: Optional[Dict[str, Any]] = None
+    window_pixels = False
+    if window_info is not None and capture_mode in ("auto", "window", "focus"):
+        if getattr(window_info, "minimized", False):
+            raise CliError(
+                f"window {window_info.title!r} is minimised and cannot be captured; "
+                "restore it first (drop --no-activate and add --focus), "
+                "or use --capture screen to capture its screen rectangle"
+            )
+        grab_window = getattr(driver, "grab_window", None)
+        if not callable(grab_window):
+            if capture_mode in ("window", "focus"):
+                raise CliError(f"backend {driver.name!r} cannot capture a window's own pixels")
+            capture_notes.append("backend has no window capture; used a screen crop")
+        else:
+            try:
+                frame = grab_window(window_info.handle)
+                blank = _blank_check(frame, args)
+                if blank and capture_mode != "window":
+                    capture_notes.append(
+                        "PrintWindow returned an empty surface (almost uniform at luma "
+                        f"{blank['darkest_luma']}-{blank['brightest_luma']}); its pixels cannot be "
+                        "captured directly"
+                    )
+                    frame = None
+                else:
+                    if sub_region:
+                        frame = _crop_frame(frame, *sub_region)
+                        region_source = f"window-region:{window_info.title}"
+                    window_pixels = True
+                    capture_notes.append(
+                        "PrintWindow(PW_RENDERFULLCONTENT): the window's own pixels, independent of "
+                        "what covers it"
+                    )
+                    if blank:
+                        capture_notes.append(
+                            "warning: this window renders almost uniformly; the app may not support "
+                            "PrintWindow - compare with --capture focus"
+                        )
+            except (DriverError, OSError, ValueError) as exc:
+                if capture_mode == "window":
+                    raise CliError(
+                        f"window capture failed: {exc}\n"
+                        "Use --capture auto or --capture focus to escalate."
+                    ) from exc
+                capture_notes.append(f"PrintWindow failed ({exc})")
+
+    # --- fallback: raise the window, BitBlt it, then restore focus ----------
+    if frame is None and window_info is not None and capture_mode in ("auto", "focus"):
+        from .backends.windows_capture import FocusForegroundCapture
+
+        restore = not bool(getattr(args, "keep_focus", False))
+        with FocusForegroundCapture(window_info.handle, restore=restore) as state:
+            if state["raised"] or state["target_was_active"]:
+                try:
+                    frame = driver.grab(region)
+                except Exception as exc:  # pragma: no cover - defensive
+                    frame = None
+                    capture_notes.append(f"foreground capture failed: {exc}")
+                else:
+                    capture_notes.append(
+                        "foreground fallback: the window was raised, BitBlt from the screen, "
+                        + ("focus restored afterwards" if state["restored"] else
+                           "focus NOT restored" if state["restore_attempted"] else
+                           "nothing to restore")
+                    )
+            else:
+                capture_notes.append(
+                    "foreground fallback unavailable: Windows refused to raise the window"
+                )
+        focus_fallback = state
+        if frame is not None and state["restore_attempted"] and not state["restored"]:
+            capture_notes.append(
+                "warning: could not restore the previously active window; it is still behind "
+                f"{window_info.title!r}"
+            )
+
+    if frame is None:
+        # last resort: a plain crop of the region, which shows whatever is on top
+        frame = driver.grab(region)
+        if window_info is not None:
+            capture_notes.append(
+                "screen crop of the window rectangle: pixels physically on screen, so a window "
+                "covering it will appear instead"
+            )
+
+    frame_stats = _sample_frame(frame.bgra, frame.width, frame.height)
+    if window_pixels and window_info is not None and not sub_region:
+        blank = _blank_check(frame, args)
+        if blank:
+            capture_notes.append(
+                "warning: this window renders almost uniformly (luma "
+                f"{blank['darkest_luma']}-{blank['brightest_luma']}); compare with --capture focus"
+            )
+
     scale = _account_scale(args.scale)
     rows = rgb_rows(frame)
     grid_meta = None
@@ -346,9 +521,17 @@ def _observe(args) -> Dict[str, Any]:
         "image": {"width": out_w, "height": out_h, "scale": scale, "bytes": encoded},
         "region_source": region_source,
         "driver": driver.name,
+        "capture": {
+            "mode": capture_mode,
+            "window_pixels": window_pixels,
+            "notes": capture_notes,
+            "pixels": frame_stats,
+        },
         "coordinate_space": "physical screen pixels (top-left origin, multi-monitor aware)",
         "bytes": encoded,
     }
+    if focus_fallback is not None:
+        result["capture"]["focus_fallback"] = focus_fallback
     if window_meta:
         result["window"] = window_meta
     if args.with_cursor:
@@ -672,6 +855,179 @@ def _scroll(args) -> Dict[str, Any]:
     return result
 
 
+def _frame_signature(frame, band: Tuple[float, float] = (0.0, 1.0)) -> str:
+    """Cheap content fingerprint of a frame (or of a horizontal band of it).
+
+    Nothing can tell us "this window is scrolled to the top", so the scroll-until
+    action detects it by observing that scrolling no longer changes any pixels.
+    Sampling every 3rd pixel in every 2nd row keeps this far cheaper than encoding
+    a PNG while still catching small changes such as a timestamp.
+    """
+    import hashlib
+
+    top = max(0, min(frame.height - 1, int(frame.height * band[0])))
+    bottom = max(top + 1, min(frame.height, int(frame.height * band[1])))
+    stride = frame.width * 4
+    digest = hashlib.blake2b(digest_size=16)
+    for y in range(top, bottom, 2):
+        row = y * stride
+        digest.update(frame.bgra[row : row + stride : 12])
+    return digest.hexdigest()
+
+
+def _scroll_until_end(args) -> Dict[str, Any]:
+    """Scroll the viewport repeatedly until its content stops changing."""
+    amount = abs(int(args.amount) or 1)
+    steps = max(1, int(args.steps) or 1)
+    delta = amount if args.direction == "up" else -amount
+    band = (0.0, 0.6) if args.direction == "up" else (0.4, 1.0)
+
+    input_driver = _input_driver(args)
+    info, focus_state = _target_window(input_driver, args)
+    point = _resolve_point(parse_coords(args.at, "--at"), info, "--at")
+    if point is None:
+        raise CliError("scroll-until-end needs --at X,Y, or --window <ref> to scroll at its centre")
+
+    capture_driver = driver_mod.load((CAP_CAPTURE,), args.backend)
+    viewport, viewport_is_window = _resolve_viewport(args, info, point, capture_driver)
+
+    if args.snapshot_each and not args.out_dir:
+        raise CliError("--snapshot-each needs --out-dir to know where to write the frames")
+    if int(args.max_scrolls) < 1:
+        raise CliError("--max-scrolls must be at least 1")
+
+    if getattr(args, "dry_run", False):
+        return {
+            "dry_run": True,
+            "planned": {
+                "direction": args.direction,
+                "notches_per_iteration": amount * steps,
+                "max_iterations": int(args.max_scrolls),
+                "stop_after_unchanged": max(1, int(args.confirm)),
+                "settle_seconds": args.settle,
+                "viewport": {"x": viewport[0], "y": viewport[1], "width": viewport[2], "height": viewport[3]},
+                "viewport_is_window": viewport_is_window,
+                "at": {"x": point[0], "y": point[1]},
+            },
+            "journal": getattr(input_driver, "journal", []),
+            "note": (
+                "scroll-until-end performs real scrolling and screenshot comparison; "
+                "--dry-run only reports the plan"
+            ),
+        }
+
+    def snapshot():
+        if viewport_is_window:
+            grab_window = getattr(capture_driver, "grab_window", None)
+            if callable(grab_window):
+                try:
+                    return grab_window(info.handle)
+                except (DriverError, OSError, ValueError):
+                    pass
+        return capture_driver.grab(viewport)
+
+    def settle():
+        if args.settle:
+            time.sleep(max(0.0, args.settle))
+
+    settle()
+    previous = snapshot()
+    previous_sig = _frame_signature(previous, band)
+    repeated = 0
+    scrolls = 0
+    reason = "max-scrolls"
+    reached_end = False
+    current_sig = previous_sig
+    current_frame = previous
+    snapshots: List[str] = []
+    stall_limit = max(1, int(args.confirm) or 2)
+
+    for iteration in range(1, max(1, int(args.max_scrolls)) + 1):
+        input_driver.scroll(delta * steps, x=point[0], y=point[1])
+        scrolls += steps
+        settle()
+        current_frame = snapshot()
+        current_sig = _frame_signature(current_frame, band)
+        if current_sig == previous_sig:
+            repeated += 1
+            if repeated >= stall_limit:
+                reached_end = True
+                reason = "no-change"
+                break
+        else:
+            repeated = 0
+            if args.snapshot_each and args.out_dir:
+                path = _resolve_output(None, f"scroll{iteration:03d}", args.out_dir)
+                rows = rgb_rows(current_frame)
+                from .png import encode_png
+
+                with open(path, "wb") as fh:
+                    fh.write(encode_png(current_frame.width, current_frame.height, rows))
+                snapshots.append(path)
+        previous_sig = current_sig
+
+    out_path = None
+    if args.out or args.out_dir:
+        out_path = _resolve_output(args.out, "scroll-end", args.out_dir)
+        from .png import encode_png
+
+        with open(out_path, "wb") as fh:
+            fh.write(
+                encode_png(current_frame.width, current_frame.height, rgb_rows(current_frame))
+            )
+
+    result: Dict[str, Any] = {
+        "reached_end": reached_end,
+        "reason": reason,
+        "scrolls": scrolls,
+        "iterations": iteration if scrolls else 0,
+        "unchanged_confirmations": repeated,
+        "viewport": {
+            "x": current_frame.origin_x,
+            "y": current_frame.origin_y,
+            "width": current_frame.width,
+            "height": current_frame.height,
+        },
+        "at": {"x": point[0], "y": point[1]},
+        "pixels": _sample_frame(current_frame.bgra, current_frame.width, current_frame.height),
+        "note": (
+            "reached_end means the content stopped changing for "
+            f"{stall_limit} consecutive scroll(s): in a chat log that is the oldest message "
+            "(or a lazy-loading / scroll-limit stall - check the final screenshot)"
+        ),
+    }
+    if out_path:
+        result["path"] = out_path
+    if snapshots:
+        result["snapshots"] = snapshots
+    if info is not None:
+        result["window"] = _window_ref(info, focus_state)
+    return result
+
+
+def _resolve_viewport(args, info, point, capture_driver):
+    """Rectangle observed while scrolling, plus whether it is the whole window.
+
+    Preference: an explicit ``--region`` -> the targeted window -> a band around
+    the scroll point on its screen.
+    """
+    if args.region:
+        rx, ry, rw, rh = _parse_region(args.region)
+        if info is not None:
+            return (info.x + rx, info.y + ry, rw, rh), False
+        return (rx, ry, rw, rh), False
+    if info is not None:
+        return (info.x, info.y, info.width, info.height), True
+    margin = int(args.margin) if args.margin else 200
+    screens = capture_driver.screens()
+    screen = next((s for s in screens if s.primary), screens[0])
+    x0 = max(screen.x, point[0] - margin)
+    y0 = max(screen.y, point[1] - margin)
+    x1 = min(screen.x + screen.width, point[0] + margin)
+    y1 = min(screen.y + screen.height, point[1] + margin)
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0)), False
+
+
 def _drag(args) -> Dict[str, Any]:
     start = parse_coords(args.start, "--start")
     end = parse_coords(args.to, "--to")
@@ -879,8 +1235,41 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument(flag, nargs="+", help=help_text)
 
     p = sub.add_parser("observe", help="capture the screen (optionally a region/window) to a PNG")
-    p.add_argument("--region", help="region 'X,Y,W,H' in physical pixels")
+    p.add_argument("--region", help="region 'X,Y,W,H' in physical pixels, or window-relative with --window")
     p.add_argument("--screen", type=int, help="screen index from the 'screens' command")
+    p.add_argument(
+        "--capture",
+        default="auto",
+        choices=["auto", "window", "focus", "screen"],
+        help=(
+            "auto (default): window's own pixels -> raise+BitBlt+restore focus -> screen crop; "
+            "'window': window's own pixels only (fails loudly); "
+            "'focus': window's own pixels -> raise+BitBlt+restore focus; "
+            "'screen': always crop the screen region"
+        ),
+    )
+    p.add_argument(
+        "--keep-focus",
+        action="store_true",
+        dest="keep_focus",
+        help="with a focus fallback, leave the raised window in front instead of restoring focus",
+    )
+    p.add_argument(
+        "--blank-threshold",
+        type=int,
+        default=250,
+        dest="blank_threshold",
+        help=(
+            "luma at or above which a window capture counts as an empty surface (0-255). "
+            "Lower it when a very bright app is wrongly treated as blank"
+        ),
+    )
+    p.add_argument(
+        "--assume-blank",
+        action="store_true",
+        dest="assume_blank",
+        help="treat the window capture as an empty surface (for testing the escalation ladder)",
+    )
     p.add_argument("--grid", type=int, nargs="?", const=100, default=0, help="burn a coordinate ruler every N px (default 100)")
     p.add_argument("--scale", type=float, default=1.0, help="downscale factor 0.1-1.0 (coordinates stay physical)")
     p.add_argument("--out", help="output PNG path")
@@ -925,6 +1314,35 @@ def build_parser() -> argparse.ArgumentParser:
     add_point(p, help_text="point to scroll over (moves the cursor there first)")
     add_windows_opts(p)
     p.set_defaults(handler=_scroll)
+
+    p = sub.add_parser(
+        "scroll-until-end",
+        help="scroll repeatedly until the content stops changing (e.g. the oldest message in a chat)",
+    )
+    p.add_argument("--direction", default="up", choices=["up", "down"], help="which way to exhaust the view")
+    p.add_argument("--amount", type=int, default=5, help="wheel notches per iteration")
+    p.add_argument("--steps", type=int, default=1, help="wheel events per iteration (throttles huge jumps)")
+    p.add_argument("--max-scrolls", type=int, default=40, dest="max_scrolls", help="safety limit on iterations")
+    p.add_argument("--settle", type=float, default=0.35, help="seconds to wait for smooth scrolling / lazy loading")
+    p.add_argument(
+        "--confirm",
+        type=int,
+        default=2,
+        help="how many consecutive unchanged captures mean 'end reached' (default 2)",
+    )
+    p.add_argument("--region", help="viewport 'X,Y,W,H' (window-relative with --window)")
+    p.add_argument("--margin", type=int, default=200, help="half-size of the observed band when no window/region is given")
+    p.add_argument("--out", help="write the final frame here")
+    p.add_argument("--out-dir", dest="out_dir", help="also write one PNG per changed iteration into this directory")
+    p.add_argument(
+        "--snapshot-each",
+        action="store_true",
+        dest="snapshot_each",
+        help="save a numbered PNG each time the content changes (needs --out-dir)",
+    )
+    add_point(p, help_text="point to scroll over (defaults to the window centre)")
+    add_windows_opts(p)
+    p.set_defaults(handler=_scroll_until_end)
 
     p = sub.add_parser("drag", help="press, move, release")
     p.add_argument("--to", required=True, help="end point 'X,Y' or '50%%,50%%' of --window")

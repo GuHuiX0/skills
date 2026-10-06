@@ -118,9 +118,66 @@ python scripts/visual_control.py observe --screen 1 --out-dir ./shots
 ```
 
 Returns `path`, `region` (`x`,`y`,`width`,`height` in physical pixels),
-`image` (`width`,`height`,`scale`), the resolved `window` when targeted, and
-optionally `cursor` and `windows`. `--scale` only shrinks the PNG; reported
-coordinates stay physical. Observing never changes focus.
+`image` (`width`,`height`,`scale`), a `capture` block describing how the pixels
+were obtained, the resolved `window` when targeted, and optionally `cursor` and
+`windows`. `--scale` only shrinks the PNG; reported coordinates stay physical.
+Observing never changes focus.
+
+### Window capture: seeing a window that something else covers
+
+`observe --window <ref>` has several ways to get pixels, chosen with `--capture`.
+It escalates, and it tells you which rung you got:
+
+| `--capture` | Ladder |
+| --- | --- |
+| `window` | **window's own pixels only** (`PrintWindow(PW_RENDERFULLCONTENT)`); if that fails or looks blank, keep it anyway and say so - never silently switches |
+| `auto` (default) | own pixels → **raise the window, BitBlt it, restore focus** → plain screen crop |
+| `focus` | own pixels → raise + BitBlt + restore (the explicit way to ask for the fallback) |
+| `screen` | always a screen crop; never raises anything |
+
+Why the middle rung exists: a screen crop of a covered window returns the
+*occluder*, and a blank own-pixel capture returns nothing useful - so when
+`PrintWindow` cannot see the window, the only honest way to get **that** window's
+pixels is to bring it forward, grab the frame immediately, and put focus back.
+
+```bash
+# watch a browser behind other windows, without disturbing the desktop
+python scripts/visual_control.py observe --window msedge.exe --out edge.png
+
+# escalate if needed, and leave the raised window in front
+python scripts/visual_control.py observe --window "Some Game" --capture focus --keep-focus
+
+# force the raw screen rectangle (true to the screen, occluders included)
+python scripts/visual_control.py observe --window msedge.exe --capture screen --out as-seen.png
+```
+
+How to tell what you got, and whether to trust it:
+
+- `capture.window_pixels` is `true` only for the window's own pixels.
+- `capture.focus_fallback` exists only when the window was raised; it reports
+  `raised`, `previous_title`, `restored` and `restore_escalated`, so a capture
+  that moved focus is never a surprise. Focus is restored by default; if Windows
+  refuses even the escalated restore you get an explicit `warning`.
+- `capture.notes` narrates the ladder, including "PrintWindow returned an empty
+  surface" and which rung produced the image.
+- `capture.pixels` samples luma (`darkest_luma`, `brightest_luma`, `dark_ratio`).
+  A very bright app can be mistaken for a blank surface; lower `--blank-threshold`
+  when that happens, or use `--capture window` to never escalate.
+- Verified on this host: with a covering window raised over a target, `screen`
+  returned the occluder while `window` returned the target's own content, and the
+  foreground was unchanged across repeated `auto` captures. A Chromium/Edge window
+  that was **not** in the foreground also captured correctly from its own pixels.
+- `PrintWindow` reads the DWM composition surface, so it does not depend on the app
+  implementing `WM_PRINT` - but a window with no surface at all cannot be captured:
+  a **minimised** window fails up front with a clear message (restore it, or use
+  `--capture screen`).
+- With `--capture window`/`focus`, `--region` is a sub-rectangle **of the window**,
+  and the reported `region` stays in screen coordinates, so points stay clickable.
+
+Input is a separate matter: synthetic mouse/keyboard still go through the normal
+input path and generally need the target to be focusable (see the targeting notes
+above). Capturing in the background is supported; *driving* an unfocused window
+reliably is not, and is deliberately out of scope for now.
 
 ### click
 
@@ -175,7 +232,7 @@ Separators are `+` or `,`. Canonical names: `ctrl`, `shift`, `alt`, `win`,
 `pgdn`, `left/right/up/down`, `f1`-`f24`, `numpad0`-`numpad9`, and single
 characters. Unknown names fail before any key is pressed.
 
-### scroll
+### scroll - scroll the wheel
 
 ```bash
 python scripts/visual_control.py scroll --direction down --amount 4
@@ -187,6 +244,42 @@ python scripts/visual_control.py scroll --direction custom --horizontal -3
 One "notch" is one wheel click (120 units). Move the pointer over the scrollable
 area first (`--at`, or `--window` to use that window's centre) - the wheel goes to
 the window under the pointer, not to the focused window.
+
+### scroll-until-end - walk a long history to its end
+
+For "keep scrolling until I reach the very beginning" (a Teams/WhatsApp group
+chat, a log viewer, an infinite feed) a fixed notch count is the wrong tool. This
+action scrolls, captures and compares frames until the view stops changing:
+
+```bash
+# up to the oldest message in a long chat
+python scripts/visual_control.py scroll-until-end --window "Microsoft Teams" \
+    --direction up --amount 4 --max-scrolls 60
+
+# down to the newest, saving a frame each time the content changes
+python scripts/visual_control.py scroll-until-end --window active --direction down \
+    --out-dir ./shots --snapshot-each
+```
+
+Returns `reached_end`, `reason` (`no-change` | `max-scrolls`), `scrolls`,
+`iterations` and the `viewport` it watched. The stop test is deliberately simple:
+no API reports "this view is at the top", so **the signal is that scrolling no
+longer changes any pixels** - the top band of the viewport when scrolling up, the
+bottom band when scrolling down - confirmed `--confirm` times in a row (default 2)
+so a slow repaint or a lazy-loading spinner cannot end the walk early.
+
+Practical notes:
+
+- `--max-scrolls` is a safety budget, not the stopping rule. If `reason` comes back
+  as `max-scrolls` the walk was cut short: raise it and run again.
+- Tune `--settle` (default 0.35s) for slow or virtualised lists; the walk is only
+  as reliable as the pause after each notch.
+- `reached_end: true` + `reason: no-change` means "the view stopped moving". In a
+  normal chat that is the oldest message, but a lazy-load stall or a hard scroll
+  limit looks the same - check the final PNG when it matters.
+- The window is raised for the duration (it must be visible to be observed), so it
+  ends up focused; that is inherent to GUI work, not a bug.
+- `--dry-run` reports the plan without scrolling anything.
 
 ### drag - press, move, release
 
@@ -274,6 +367,11 @@ Coordinates are accepted as `640,360`, `640 360` or `640;360`. For text, prefer
 | `failed to focus window ... foreground change` | Windows' foreground lock: retry with `--force-focus`, or ask the user to click the app and use `--window active`, or use `--no-activate` |
 | `no window matching 'X'` | the message lists the visible titles; use a substring, `--match` first, or `active` |
 | `--window last` says nothing to reuse | the temp state file is gone or no command has resolved a window yet; name the window once |
+| window capture comes back blank/white/black | that window has no readable surface - `--capture focus` raises it for a screen grab (restores focus), or `--capture screen` |
+| `... is minimised and cannot be captured` | restore it (`--focus`) or use `--capture screen`; a minimised window has no surface to render |
+| capture shows a *different* app than requested | you got a screen crop and something covers the window; check `capture.window_pixels`, then use `--capture focus` |
+| capture moved my focus / a window jumped forward | the fallback ran; `capture.focus_fallback` explains it. Add `--keep-focus` to leave it in front, or `--capture window` to forbid the fallback |
+| a bright app is called "blank" | lower `--blank-threshold` (default 250) or use `--capture window` |
 | clicks land on the wrong spot | observe again right before acting; the UI moved |
 | clicks ignored in one app | that window is DPI-unaware or elevated: observe it, then click the pixels you see |
 | typed text missing characters | slow down with `--interval 0.05`, or use `--method clipboard` |

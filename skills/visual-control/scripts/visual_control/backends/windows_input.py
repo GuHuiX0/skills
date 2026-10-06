@@ -349,6 +349,39 @@ def probe() -> Tuple[bool, str]:
     return True, ""
 
 
+def force_foreground(handle: int) -> bool:
+    """Raise *handle* using AttachThreadInput, defeating the foreground lock.
+
+    ``SetForegroundWindow`` is refused when the calling process does not own the
+    current foreground window, which is the normal situation for an agent-driven
+    shell - both to raise a target and, importantly, to put focus *back* where it
+    was.  Attaching our input queue to the target thread is the standard workaround.
+    """
+    hwnd = wintypes.HWND(int(handle))
+    if not user32.IsWindow(hwnd):
+        return False
+    target_hwnd = _hwnd(hwnd)
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    current_thread = kernel32.GetCurrentThreadId()
+    foreground = user32.GetForegroundWindow()
+    foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    attached = []
+    try:
+        for thread in {foreground_thread, current_thread}:
+            if thread and thread != target_thread and user32.AttachThreadInput(thread, target_thread, True):
+                attached.append(thread)
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.BringWindowToTop(hwnd)
+        user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetActiveWindow(hwnd)
+        time.sleep(0.12)
+    finally:
+        for thread in attached:
+            user32.AttachThreadInput(thread, target_thread, False)
+    return bool(_hwnd(user32.GetForegroundWindow()) == target_hwnd)
+
+
 class WindowsInputDriver(BaseDriver):
     name = "windows-input"
     capabilities = (CAP_INPUT, "windows")
@@ -595,29 +628,10 @@ class WindowsInputDriver(BaseDriver):
                 return True
         if not force:
             return False
-        return self._force_foreground(hwnd)
+        return force_foreground(int(handle))
 
-    def _force_foreground(self, hwnd) -> bool:
-        target_hwnd = _hwnd(hwnd)
-        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-        current_thread = kernel32.GetCurrentThreadId()
-        foreground = user32.GetForegroundWindow()
-        foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
-        attached = []
-        try:
-            for thread in {foreground_thread, current_thread}:
-                if thread and thread != target_thread and user32.AttachThreadInput(thread, target_thread, True):
-                    attached.append(thread)
-            user32.ShowWindow(hwnd, SW_RESTORE)
-            user32.BringWindowToTop(hwnd)
-            user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-            user32.SetForegroundWindow(hwnd)
-            user32.SetActiveWindow(hwnd)
-            time.sleep(0.12)
-        finally:
-            for thread in attached:
-                user32.AttachThreadInput(thread, target_thread, False)
-        return bool(_hwnd(user32.GetForegroundWindow()) == target_hwnd)
+    def _force_foreground(self, hwnd) -> bool:  # kept for backwards compatibility
+        return force_foreground(int(hwnd))
 
 
 def build(dry_run: bool = False):

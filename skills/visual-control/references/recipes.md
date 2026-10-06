@@ -59,6 +59,27 @@ python scripts/visual_control.py observe --region 300,200,1200,800 --out scan.pn
 Stop after a fixed number of iterations (10-15) and report failure - endless
 scrolling usually means the target is in a different pane.
 
+## Pattern: walk a long history to its oldest entry
+
+A fixed notch count cannot express "go back to the beginning" - the distance
+depends on how much history there is. Use the iterative action, which stops when
+the view stops changing:
+
+```bash
+python scripts/visual_control.py scroll-until-end --window "Microsoft Teams" \
+    --direction up --amount 4 --max-scrolls 60 --out ./oldest.png
+python scripts/visual_control.py observe --window "Microsoft Teams" --out ./verify.png
+```
+
+Then read `oldest.png` to confirm the first message is really there. If the result
+said `reason: max-scrolls`, run the same command again from where it stopped - the
+walk is stateless, so resuming is just re-running it.
+
+For a targeted search (a date, a name) there is no text matcher to lean on: walk in
+chunks with `--out-dir ./shots --snapshot-each` and inspect the numbered frames.
+Prefer smaller `--amount` values for virtualised lists, which discard items that
+were never rendered.
+
 ## Pattern: drag and drop
 
 ```bash

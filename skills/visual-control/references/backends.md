@@ -38,6 +38,7 @@ CAP_INPUT   = "input"     # cursor_pos, move, click, scroll, drag, key_down/up,
 | --- | --- |
 | `screens() -> list[Screen]` | physical bounds + `primary` flag per display |
 | `grab((x, y, w, h)) -> Frame` | BGRA bytes, `width*height*4`, optional `origin_x/origin_y` |
+| `grab_window(handle) -> Frame` | optional; the window's own pixels, independent of occluders |
 | `cursor_pos() -> (x, y)` | physical pixels |
 | `move(x, y, duration)` | `duration` > 0 interpolates for smooth/hoverable motion |
 | `click(x, y, button, count, interval, duration)` | `x/y` may be `None` = current position |
@@ -135,6 +136,39 @@ Rules of thumb:
   False**. Compare `_hwnd(a) == _hwnd(b)` (see `windows_input._hwnd`); a silent
   always-False handle comparison is how "focus" and "active window" quietly break.
 
+## Capture paths, and why there are three
+
+`grab(region)` is a BitBlt of the desktop: truthful about the screen, so a window
+covering the region appears in the result. `grab_window(handle)` is
+`PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)`: it reads the window's DWM
+composition surface, which makes the result independent of z-order, of what covers
+it, and of whether it is on screen. The CLI escalates between them
+(`--capture auto|window|focus|screen`) and reports the rung in
+`capture.window_pixels` / `capture.notes`.
+
+- **Measured on this host (Windows 11 build 26100)**: `PrintWindow` with
+  `PW_RENDERFULLCONTENT` returned the true content even while the app refused
+  `WM_PRINTCLIENT`, i.e. it does not depend on the app implementing `WM_PRINT`.
+  That is why a blank result means "no composition surface", not "app declined".
+- `PrintWindow` needs a surface: minimised windows have none, so `grab_window`
+  refuses them up front instead of returning a title-bar strip.
+- `FocusForegroundCapture` is the middle rung for the cases where the surface is
+  empty: raise the window, BitBlt its rectangle while it is actually in front, then
+  restore the previous foreground window. Raising tends to succeed with a plain
+  `SetForegroundWindow` (the foreground lock grants one to the most recent
+  requester), while the *restore* is normally refused - so it escalates through
+  `windows_input.force_foreground` (`AttachThreadInput`). Both facts are recorded in
+  `capture.focus_fallback` rather than hidden.
+- `_sample_frame()` / `_blank_check()` in `cli.py` sample luma to detect an empty
+  surface; `--assume-blank` forces that verdict so the ladder stays testable, since
+  a genuinely blank surface cannot be produced from a normal test application.
+- A future `Windows.Graphics.Capture` backend (`CreateFromWindowId` +
+  `Direct3D11CaptureFramePool`) would be the next rung for surfaces `PrintWindow`
+  cannot read at all, including some GPU-only composition. It needs a D3D11 device
+  and WinRT activation through `RoGetActivationFactory`; the driver contract above
+  already accommodates it as another `capture` backend, and `--capture` gives users
+  a way to select it when it exists.
+
 ## Window targeting
 
 `cli.py` resolves `--window` into a `WindowInfo` (`_find_window`) and supports the
@@ -168,7 +202,9 @@ window-relative by `_resolve_point`, which also understands `50%,50%` and
 ```powershell
 python scripts/visual_control.py backends
 python scripts/visual_control.py selftest
-powershell -File scripts/e2e_input_test.ps1     # real click/type/hotkey/scroll/drag
+powershell -File scripts/test_occlusion_capture.ps1   # own-pixels capture ignores occluders
+powershell -File scripts/test_capture_escalation.ps1  # fallback raises + restores focus
+powershell -File scripts/e2e_input_test.ps1           # real click/type/hotkey/scroll/drag
 ```
 
 The end-to-end script opens a throwaway WinForms window, drives it with the CLI,
