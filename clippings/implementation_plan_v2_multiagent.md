@@ -4,6 +4,9 @@ Status: proposed code changes, based on checkout `cd1b45c`. This document does
 not implement or enable the feature. New paths, APIs, settings, tool names,
 and defaults below are proposals.
 
+These contracts are design decisions for Gemini CLI. They are not claims about
+Codex's internal lock placement, event batching, or subagent workspace setup.
+
 Build persistent, addressable agents inside the Gemini CLI process. An agent
 retains its identity and private model conversation across assignments. The
 coordinator can create agents, continue its own work, exchange messages,
@@ -45,6 +48,9 @@ First-release limits:
 
 - State lives for the CLI process lifetime. Record history for inspection, but
   do not advertise team restoration after process restart.
+- Finishing a parent request leaves settled workers idle and reusable across
+  later user requests. Agent disposal requires explicit closure or root-runtime
+  disposal; completion is not disposal.
 - Agents share the selected workspace. Automatic worktree provisioning and
   automatic merging are deferred.
 - Existing remote A2A and browser specialist invocation paths remain separate.
@@ -138,6 +144,13 @@ agent IDs, assignment IDs, run IDs, stream IDs, message IDs, tool-call IDs, and
 approval IDs. In version 1, one assignment creates one run; interrupted runs
 are terminal and explicit retry creates a new run linked to the original.
 
+An activation is a contiguous interval of execution before a cooperative wait
+or completion boundary. One run can span multiple activations and model calls.
+Resuming a suspended run preserves its run ID; do not manufacture another
+assignment for each child result. Give activation streams distinct identities
+and retain their owning run and root-request IDs in events. The root request
+groups the root run and all causally associated descendant assignments.
+
 Transitions:
 
 | Event | Required transition |
@@ -145,7 +158,7 @@ Transitions:
 | Spawn accepted | Reserve identity/capacity, initialize executor, queue initial assignment |
 | Initialization fails | Remove live reservation, emit creation failure, return a typed error |
 | Scheduler dispatches | `queued -> running`, one run owns the conversation |
-| Assignment finishes normally | Run becomes `completed`; agent becomes `idle` or dispatches queued work |
+| Assignment finishes normally | After its dependency barrier settles, run becomes `completed`; agent becomes `idle` or dispatches queued work |
 | Agent waits for a result or approval | `running -> waiting`; retain run identity and release runnable capacity |
 | Wait resolves | Reacquire runnable capacity before further model/tool execution |
 | Interrupt | Cancel current/selected queued run, settle its tool outcomes, preserve agent history |
@@ -153,8 +166,9 @@ Transitions:
 | Close | Reject new work, cancel queued work and active execution, dispose after it settles |
 | Unsafe history or unsettled tool | Hold agent in a visible blocked wait; do not silently dispatch another run |
 
-Represent waiting reasons explicitly: `agent_update`, `approval`, `budget`, or
-`reconciliation_required`. A failed activation is not a destroyed agent.
+Represent waiting reasons explicitly: `agent_update`, `approval`,
+`workspace_lease`, `budget`, or `reconciliation_required`. A failed activation
+is not a destroyed agent.
 `agent_end` remains a stream/activation boundary; emit separate lifecycle events
 for agent closure. Define closure of a parent as closing its descendants too;
 reject closure of the root through model tools.
@@ -237,15 +251,21 @@ Add the following modules and colocated tests:
   is already working, the assignment waits for that run to settle.
 - Results are addressed to the assigning agent, which may differ from the
   worker's original parent. Emit one completion notification per run.
-- A result consumes a parent's registered wait when one matches. Otherwise it
-  enters the inbox and can activate the idle parent while the originating root
-  request is still open. Information-only messages do not activate idle agents.
+- Record a result in the assigning agent's inbox before evaluating its wait or
+  completion barrier. A matching result can resume the owning suspended run.
+  If that run or cause is already terminal, retain the result for inspection;
+  do not invent an assignment or reactivate a cancelled request. Information-only
+  messages do not activate idle agents.
 - When an active run consumes information, append it to the model input after
   settling pending function responses. Do not manufacture a response for an
   unrelated function call or run two requests against one history.
-- Deduplicate tool-triggered mutations using caller/run/tool-call identity.
+- Distinguish accepted, appended-to-history, and terminal-outcome states. Mark
+  an inbox item consumed only after its native history append commits. A stream
+  retry or compression must not silently consume or append the same item again.
+- Deduplicate runtime control mutations using caller/run/tool-call identity.
   New tool calls without an explicit retry key are new operations. Return the
-  accepted ID for repeated delivery of the same invocation.
+  accepted ID for repeated delivery of the same invocation. This deduplication
+  does not establish exactly-once external shell, file, or network effects.
 - Queue overflow returns a typed error. Never silently drop an accepted task.
   Define maximum message size and a bounded attachment/artifact reference path
   for large results.
@@ -256,12 +276,55 @@ while checking already-recorded events, avoiding a check/subscribe race. A
 message arriving during finalization must either be consumed in the current
 activation or leave an observable queued activation after it.
 
+Keep runtime state transitions short. Reserve/validate state under its serialized
+owner, perform model, tool, initialization, or approval work outside it, then
+commit the outcome with an expected run/generation check. Never await external
+execution while holding the runtime state mutex or reducer transaction.
+
+### Wait groups and coalesced wakeups
+
+Add `runtime/waits.ts` with explicit wait registration and dependency tracking.
+`wait_agents` accepts `mode: 'any' | 'all'` with default `any`. Targets identify
+agents and preferably concrete run IDs; an agent-only target is resolved once
+at registration to its current or latest accepted run. Return the resolved IDs
+and reject agents without a run. Later follow-up assignments cannot change the
+membership of an existing wait.
+
+- `any` resolves when at least one selected run is terminal. Return all selected
+  outcomes currently available, not only the event that triggered the wakeup.
+- `all` resolves when every selected run is terminal. Failure, interruption, and
+  cancellation count as terminal outcomes and retain their actual status.
+- Timeout returns accumulated outcomes and unresolved targets without cancelling
+  workers. Empty target lists and unrelated completion events do not resolve a
+  wait; empty target lists are rejected at validation.
+- Evaluate recorded terminal outcomes even if the event cursor is newer. The
+  cursor controls incremental update replay, not the underlying run status.
+  Keep cursor scope local to the observing agent and validate its range.
+- A wait owns its result delivery. Do not inject duplicate standalone result
+  messages for the same outcome into that run's next model input. Preserve the
+  inbox/history bookkeeping even if a wait is interrupted before delivery.
+
+Maintain at most one pending resumption token per agent for its current run and
+cause. Running agents consume available updates at the next safe boundary.
+Waiting agents resume only when their wait condition, dependency barrier, or
+addressed user steering permits it. Merge updates arriving before dispatch into
+the pending activation without resetting its fairness position. This requires
+no fixed debounce sleep. Information that arrives after a model request starts
+waits for the next safe boundary.
+
+N worker completions therefore do not require N coordinator activations. A
+wait-all group can resume once with all results; a wait-any workflow can resume
+incrementally, potentially once per spaced completion. Both stay within the
+same open root request. Make activation counts and wakeup reasons observable
+so tests can distinguish batching from dropped notifications.
+
 ### Scheduling and budgets
 
 - Set one active run per agent and a global runnable limit including the root.
 - A suspended run keeps its stack/continuation, but releases its runnable slot.
   Reacquire before another model request or tool execution.
-- Suspend at explicit `wait_agents` and approval boundaries. Do not infer a
+- Suspend at explicit `wait_agents`, approval, and cancellable workspace-lease
+  waits when no mutation has begun. Do not infer a
   cooperative yield merely because an arbitrary network request is pending.
 - Test a one-slot parent/child wait. Detect waits on self and cycles in explicit
   agent-wait dependencies; return actionable errors instead of hanging.
@@ -275,16 +338,55 @@ activation or leave an observable queued activation after it.
 ### Shared workspace
 
 Existing per-scheduler edit ordering does not coordinate different agents.
-Acquire a runtime-wide mutation lease after approval and before dispatch of
-file writes, edits, mutating shell commands, and MCP operations with uncertain
-effects. Include the root and enabled legacy delegation paths. Unknown shell
-and MCP effects use the conservative mutation path.
+Use a shared mutation coordinator across root, workers, and enabled legacy
+delegation paths. Treat unknown shell and MCP effects conservatively. Acquire
+only at the executor's final pre-effect boundary, after planning and approval:
 
-Preserve stale-content checks after waiting for a lease. Release it on every
-terminal tool outcome. Never hold a lease while waiting for an agent result or
-approval. Reads may observe work between mutations; the prompt must not promise
-snapshot consistency. Require explicit re-read/validation before dependent edits.
-Per-worktree roots and stronger read/write transaction isolation are later work.
+1. Prepare the operation and obtain its required approval without a lease.
+2. Wait cancellably for the lease. Do not hold the runtime state lock or a
+   runnable permit while waiting when no external operation has begun.
+3. Once capacity and lease are available, recheck cancellation, run generation,
+   current policy, and any approval binding. If renewed approval is needed,
+   release resources before prompting again.
+4. Re-read and validate edit preconditions while holding the lease, immediately
+   before dispatching the mutating operation. Do not acquire only at the final
+   write syscall after an unprotected validation step.
+5. Retain the lease until the operation's mutating execution has settled. Release
+   it in the executor's guaranteed cleanup path before the next model request.
+
+Define this resource acquisition as a runtime-managed reservation. Never hold
+a mutation lease while awaiting a runnable permit; avoid the inverse by making
+permit/lease acquisition cancellable and releasing a provisional permit when
+the lease cannot be acquired immediately. Check cancellation again at dispatch.
+
+| Boundary | Mutation lease ownership |
+| --- | --- |
+| Model generation, planning, or task assignment | None |
+| Approval or agent wait | None |
+| Final validation and mutating execution | Held for the affected operation |
+| Tool returns output while a subprocess is still writing | Operation remains unsettled; do not release based on output alone |
+| Model processes a settled tool result | None |
+
+A lock must not span an LLM request, approval prompt, or agent wait. Logical task
+ownership may span those boundaries but is separate from execution exclusion.
+For a multi-phase tool, acquire separately around independently valid mutations,
+or keep one lease around an inseparable read/validate/write unit. An unexpected
+approval during execution requires a safe quiescent boundary or cancellation;
+do not release exclusion while the process continues writing.
+
+Disallow detached/background mutating shell execution in shared mode for this
+release. Cancellation requests are not proof of subprocess termination. If the
+executor cannot establish that mutation has stopped, quarantine that resource,
+show `reconciliation_required`, and block conflicting dispatch until resolved.
+Do not release exclusion merely because an AbortSignal fired or a lease timer
+expired; expiry alone cannot fence an existing filesystem writer.
+
+This exclusion coordinates participating tools in one runtime, not arbitrary
+editors or external processes. Preserve stale-content checks and avoid promising
+snapshot consistency for unlocked reads. Use a canonical execution-root resource
+key in version 1; future worktrees also need a shared-repository key for Git
+metadata mutations. Per-worktree roots and stronger transaction isolation remain
+later work.
 
 ## 6. Model-facing tools and policy
 
@@ -297,7 +399,7 @@ Use runtime schemas for argument validation and typed error codes.
 | `spawn_agent` | `definition_name`, `task`, optional bounded `context` and display name | Stable agent/assignment/run IDs and `queued`; waits for initialization, not task completion |
 | `send_message` | `agent_id`, `message`, optional correlation ID | Message ID and `accepted`; does not promise consumption or task completion |
 | `assign_agent` | `agent_id`, `task` | Assignment/run IDs and `queued`; appends work to an existing agent |
-| `wait_agents` | Target agent IDs, event cursor, bounded timeout | Updates, next cursor, timeout indication; runtime suspends caller while waiting |
+| `wait_agents` | Targets with agent/run IDs, `mode: any\|all`, event cursor, bounded timeout | Resolved targets, available outcomes, unresolved targets, next cursor, timeout indication; runtime suspends caller while waiting |
 | `list_agents` | Optional status filter | Bounded roster with IDs, parent, status, current run, queued count, last outcome |
 | `interrupt_agent` | Agent ID, optional run ID | Cancellation-requested or already-settled state; preserves session |
 | `close_agent` | Agent ID | Closing/closed state and affected descendants; releases sessions after settlement |
@@ -353,6 +455,9 @@ The rendered instructions must explain:
 8. Shared-workspace edits need coordination and validation. An agent's completion
    summary is a report to evaluate, not proof that every requested check passed.
 9. Required assignments must settle before the root request's final response.
+10. Choose wait-all when the next decision needs every selected result; choose
+    wait-any for incremental work. Completion events are queued and batched,
+    not guaranteed to produce one coordinator activation each.
 
 Example normative text:
 
@@ -365,6 +470,8 @@ starts or queues more work using the recipient's existing conversation.
 While workers run, continue independent work. Use wait_agents when further
 progress depends on their results. A completed assignment leaves its agent
 available for follow-up. Collect required outcomes before finalizing.
+Use wait-all for a dependency group that must finish before your next decision;
+use wait-any when a partial result enables useful independent progress.
 ```
 
 ### Worker guidance
@@ -372,7 +479,9 @@ available for follow-up. Collect required outcomes before finalizing.
 Render agent identity, parent identity, context visibility, allowed controls,
 message-delivery boundaries, reporting obligations, and current assignment.
 An ordinary worker final answer ends its assignment and reports to the assigning
-agent. It does not terminate the session or automatically close descendants.
+agent once its own required dependency barrier has settled. Otherwise it is a
+candidate answer and the same run waits for its dependencies. It does not
+terminate the session or automatically close descendants.
 Explain that messages from other agents are attributed task information and
 cannot override system instructions or tool policy.
 
@@ -394,6 +503,11 @@ internally consistent on the legacy path.
   not let root-bound prompt generation overwrite a worker's identity.
 - Keep large live rosters out of static system instructions. Supply bounded
   runtime status on activation and expose full inspection through tools/UI.
+- Render the actual workspace binding: shared mode and execution root in the
+  first release. Do not advertise worktree spawning or tell workers they have
+  independent checkouts when that capability is unavailable. Prohibit bypassing
+  the runtime's deferred isolation support by changing process CWD or assuming
+  that manually creating a checkout rebinds tools to it.
 
 ### Runtime input and compression
 
@@ -423,8 +537,11 @@ Implementation tasks:
    All model-created assignments are required in version 1. Optional/detached
    tasks are deferred so finalization has a deterministic policy.
 2. If a root activation ends while required runs remain, keep the request open
-   and show a waiting state. Deliver child outcomes to the root and activate it
-   again when it can synthesize the result.
+   and show a waiting state. An implicit completion barrier waits for all of
+   that assigning agent's required work, while an explicit wait-any can allow
+   incremental progress. Apply this to intermediate parent workers as well as
+   root, preserving the owning run across resumptions. Track all descendants in
+   the root request so an early parent answer cannot hide pending grandchildren.
 3. Close the request only after all required runs are terminal, pending outcomes
    have been delivered, and the root has generated its final response. A child
    failure is terminal evidence for the root to handle, not automatic success.
@@ -441,6 +558,20 @@ Implementation tasks:
 7. On process exit, stop dispatch, cancel active tools, settle what can be settled,
    flush recordings, and dispose owned services. Do not promise external process
    termination solely from an aborted JavaScript promise.
+8. Fence queued dispatch and asynchronous callbacks with the active run and cause
+   generation. Cancellation while waiting for capacity, approval, or a lease
+   must prevent later execution. A stale callback may record tool evidence but
+   cannot overwrite a newer run or trigger automatic wakeup.
+9. Cancellation, exhausted budgets, and fatal runtime failures have a host-owned
+   terminal-report path that does not require another model request. Report
+   unresolved or quarantined operations explicitly rather than claim success.
+   This is the failure-path exception to model-generated normal finalization.
+
+After a request closes, keep settled worker sessions idle. The next user request
+can assign work to their stable IDs and existing histories under a new cause ID.
+Do not automatically close agents at final response, resume old cancelled causes,
+or consume previous pending information as a new assignment. Bound retained state
+and tell users when explicit closure is needed to free live-agent capacity.
 
 ## 9. Terminal, headless output, events, and approvals
 
@@ -537,10 +668,10 @@ enabled configuration until runtime, tools, prompts, and both CLI paths agree.
 | --- | --- | --- |
 | 1. Execution ownership | Add context factory, dependency inventory, client context fixes, context-bound tool construction | Two initialized sessions have distinct histories, models, recordings, cancellation, and independently disposable services |
 | 2. Persistent loop | Extract reusable executor from legacy protocol; add boundary hooks and root adoption | Three assignments use one worker history; normal completion, error, interruption, and reuse preserve valid Gemini history |
-| 3. Runtime state machine | Add store, mailboxes, scheduler, waits, causal limits, fake executors | Deterministic spawn/message/assign/wait/interrupt/close tests pass, including one-slot waits and completion races |
-| 4. Tools and permissions | Add schemas, tool factories, registration, policy, nested spawning, workspace coordination | Same-definition workers remain isolated; forged sender IDs and privilege expansion fail; writes serialize across root and workers |
+| 3. Runtime state machine | Add store, mailboxes, scheduler, wait groups, coalesced resumptions, causal limits, fake executors | Deterministic spawn/message/assign/wait/interrupt/close tests pass, including any/all waits, one-slot progress, pinned target runs, and completion races |
+| 4. Tools and permissions | Add schemas, tool factories, registration, policy, nested spawning, operation-scoped workspace coordination | Same-definition workers remain isolated; forged sender IDs and privilege expansion fail; write exclusion and cancellation fencing cover root and workers |
 | 5. Model protocol | Add collaboration renderer, prompt wiring, custom-prompt handling, input formatting, compression snapshots | Modern/legacy/root/worker prompts match exposed tools; scripted model follows an incremental follow-up and receives valid attributed updates |
-| 6. Root orchestration | Add root-request completion barrier, wakeups, steering, budget and cancel propagation | Root spawns, continues work, becomes idle, wakes on results, synthesizes once, and cancels without resurrection |
+| 6. Root orchestration | Add recursive dependency barriers, coalesced wakeups, steering, budget and cancel propagation | Parents resume within their owning runs; root accounts for grandchildren, synthesizes after settlement, and cancels without resurrection; idle workers survive into the next request |
 | 7. CLI and output | Add runtime hook/reducer, inspection commands/panel, approval attribution, headless integration | UI switching preserves all runs; inactive-agent approval is routed correctly; text/JSON/streaming outputs have defined completion |
 | 8. Release preparation | Wire settings and generated schema/docs, public exports, tracing, integration coverage | Flag-off regression suite and flag-on end-to-end scenarios pass; no app server dependency is introduced |
 
@@ -562,13 +693,15 @@ Live API access is optional exploratory validation, not a unit-test prerequisite
 | Async spawn | Tool returns before worker completion; root performs independent work before waiting |
 | Messaging | Information during model/tool work, information to idle worker, queued follow-up during work, overflow, bounded large result, repeated invocation deduplication |
 | Wakeup races | Result before wait registration, during final idle handoff, after root activation end, and during request finalization |
+| Wait groups and batching | Any/all waits, one resumption token for a burst of completions, spaced outcomes, timeout without worker cancellation, terminal outcomes newer/older than cursor, follow-up run cannot retarget an existing wait, no duplicate history delivery |
 | Scheduler | One active run per agent, bounded total capacity, one-slot dependency progress, fair dispatch, self/cyclic wait rejection, cancellation while reacquiring a slot |
 | Lifecycle | Interrupt retains context; close rejects new work and closes descendants; creation failure releases reservations; repeated close is harmless |
 | Tool history | Partial streams, pending function responses, rejected approvals, cancelled tools, final response and subsequent assignment form a valid Gemini sequence |
 | Permissions | Plan/headless policies, sibling control limits, sender spoofing, worker permission ceiling, nested depth/creation caps |
-| Workspace | Two workers and root compete for edits; stale edit checks run after lease acquisition; failed/cancelled tools release leases; no lease held during agent waits |
+| Workspace | Two workers and root compete for edits; approval precedes acquisition; stale checks occur under lease; no lease spans LLM/approval/agent waits; confirmed settlement releases leases; uncertain writers quarantine resources; detached mutations rejected |
+| Cancellation fencing | Cancel while queued for a lease/permit or awaiting approval, delayed grant after cancellation, stale completion after reuse, exhausted budget needs no final model call |
 | Prompt protocol | Modern/legacy variants, feature off, partial capabilities, custom system prompt, model switch, untrusted peer text, bounded seed without implied full inheritance |
-| Root completion | Required child errors reach root, all required outcomes consumed, no early final result, new input precedence, Ctrl+C stops causal wakeups |
+| Root completion | Required child errors reach root, grandchildren stay accounted for, no early final result, new input precedence, Ctrl+C stops causal wakeups, worker history reused after the previous request's final answer |
 | UI and approvals | Two same-definition workers, inspection switching, concurrent inactive-agent approvals, event deduplication, stale run updates, root-only ordinary input |
 | Headless and cleanup | Correct final/exit status, no indefinite approval wait, no leaked timers/listeners/slots, shared MCP survives closing one worker |
 
@@ -604,7 +737,13 @@ Add these only after the in-process acceptance gates pass:
    and make inheritance explicit in both spawn schema and prompts.
 3. **Worktrees:** integrate `WorktreeService` with pinned base commits and explicit
    per-agent execution roots. Avoid the CLI helper's process-wide `chdir()` and
-   automatic cleanup when an agent closes.
+   automatic cleanup when an agent closes. Add an explicit capability and a
+   `spawn_agent` workspace-mode option only when provisioning and tool rebinding
+   are implemented. The runtime creates/validates the checkout and returns its
+   binding; the model requests a supported mode rather than manually improvising
+   setup. Reject unavailable modes. Explain that peer edits are not automatically
+   visible across worktrees and require commit, patch, or artifact exchange.
+   Shared repository metadata and external services still need coordination.
 4. **App server:** host the same runtime behind a typed facade for execution after
    terminal disconnect and later reattachment. Add transport authentication,
    connection ownership, approval routing, and durable replay before promising
